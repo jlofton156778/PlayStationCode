@@ -1,0 +1,226 @@
+import.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
+
+import com.psnapi.PSNApi;
+import com.psnapi.exception.PSNApiException;
+import com.psnapi.model.Trophy;
+import com.psnapi.model.TrophyRarity;
+import com.psnapi.model.TrophyType;
+import com.psnapi.model.response.TitleTrophiesResponse;
+import com.psnapi.model.response.UserTitlesResponse;
+import com.psnapi.model.response.UserTrophiesEarnedForTitleResponse;
+
+public class TrophyFetcher {
+    private static final String NPSSO = "CgPN8eHIYeO1JavZedT9LcKHCqGsOqeA1eCyle3LAnQfJ2E5OSIPUVzaVpbk1oxx";
+    private static final String USERNAME = "KingOfFlubb";
+
+    public static void main(String[] args) {
+        try {
+            // Authenticate and become authorized with PSN.
+            System.out.println("Exchanging NPSSO for access code...");
+            String accessCode = PSNApi.exchangeNpssoForCode(NPSSO);
+            System.out.println("Exchanging access code for access token...");
+            String authorization = PSNApi.exchangeCodeForAccessToken(accessCode);
+
+            // Get the user's account ID from username
+            System.out.println("Fetching account ID for username: " + USERNAME + "...");
+            String targetAccountId = getExactMatchAccountId(authorization, USERNAME);
+            System.out.println("Fetched account ID: " + targetAccountId);
+
+            // Get the user's list of titles (games).
+            System.out.println("Fetching user titles...");
+            List<UserTitlesResponse.TrophyTitle> trophyTitles = fetchAllTitles(authorization, targetAccountId);
+            System.out.println("User titles fetched successfully. Total titles: " + trophyTitles.size());
+
+            // Prepare the file for writing
+            String filePath = "./" + USERNAME + ".json";
+            BufferedWriter writer = new BufferedWriter(new FileWriter(filePath));
+
+            // Process titles in parallel
+            List<CompletableFuture<TitleResult>> titlePromises = trophyTitles.stream()
+                    .map(title -> CompletableFuture.supplyAsync(() -> processTitleTrophies(authorization, targetAccountId, title)))
+                    .collect(Collectors.toList());
+
+            // Wait for all title processing to complete
+            List<TitleResult> titleResults = titlePromises.stream()
+                    .map(CompletableFuture::join)
+                    .collect(Collectors.toList());
+
+            // Sort the results by the original index
+            titleResults.sort((a, b) -> a.index - b.index);
+
+            // Write the achievements of each title to the user's JSON file
+            for (TitleResult titleResult : titleResults) {
+                UserTitlesResponse.TrophyTitle title = trophyTitles.get(titleResult.index);
+                appendToGamesJSON(writer, title.trophyTitleName, title.trophyTitlePlatform, titleResult.mergedTrophies);
+            }
+
+            writer.close();
+            System.out.println("Script completed successfully.");
+        } catch (Exception e) {
+            System.err.println("An error occurred during the script execution: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static String getExactMatchAccountId(String authorization, String username) throws PSNApiException {
+        List<PSNApi.UniversalSearchResult> allAccountsSearchResults = PSNApi.makeUniversalSearch(authorization, username, "SocialAllAccounts");
+
+        PSNApi.UniversalSearchResult exactMatchAccount = allAccountsSearchResults.stream()
+                .filter(result -> result.getSocialMetadata().getOnlineId().equals(username))
+                .findFirst()
+                .orElseThrow(() -> new RuntimeException("No exact match found for username: " + username));
+
+        return exactMatchAccount.getSocialMetadata().getAccountId();
+    }
+
+    private static List<UserTitlesResponse.TrophyTitle> fetchAllTitles(String authorization, String accountId) throws PSNApiException {
+        List<UserTitlesResponse.TrophyTitle> titles = new ArrayList<>();
+        int offset = 0;
+        int limit = 100;
+
+        while (true) {
+            UserTitlesResponse response = PSNApi.getUserTitles(authorization, accountId, limit, offset);
+            titles.addAll(response.getTrophyTitles());
+
+            if (response.getTrophyTitles().size() < limit) break;
+            offset += limit;
+        }
+
+        return titles;
+    }
+
+    private static List<Trophy> fetchAllTrophies(String authorization, String npCommunicationId, String platform) throws PSNApiException {
+        List<Trophy> trophies = new ArrayList<>();
+        int offset = 0;
+        int limit = 100;
+
+        while (true) {
+            TitleTrophiesResponse response = PSNApi.getTitleTrophies(authorization, npCommunicationId, "all", limit, offset, platform.equals("PS5") ? null : "trophy");
+            trophies.addAll(response.getTrophies());
+
+            if (response.getTrophies().size() < limit) break;
+            offset += limit;
+        }
+
+        return trophies;
+    }
+
+    private static List<Trophy> fetchAllEarnedTrophies(String authorization, String accountId, String npCommunicationId, String platform) throws PSNApiException {
+        List<Trophy> trophies = new ArrayList<>();
+        int offset = 0;
+        int limit = 100;
+
+        while (true) {
+            UserTrophiesEarnedForTitleResponse response = PSNApi.getUserTrophiesEarnedForTitle(authorization, accountId, npCommunicationId, "all", limit, offset, platform.equals("PS5") ? null : "trophy");
+            trophies.addAll(response.getTrophies());
+
+            if (response.getTrophies().size() < limit) break;
+            offset += limit;
+        }
+
+        return trophies;
+    }
+
+    private static void appendToGamesJSON(BufferedWriter writer, String gameName, String platform, List<Map<String, Object>> trophyList) {
+        Map<String, Object> gameData = new HashMap<>();
+        gameData.put("gameName", gameName);
+        gameData.put("platform", platform);
+        gameData.put("trophyList", trophyList);
+
+        try {
+            writer.write(gameData.toString());
+            writer.newLine();
+            System.out.println("Data for " + gameName + " appended to " + USERNAME + ".json successfully.");
+        } catch (IOException e) {
+            System.err.println("Error appending data for " + gameName + " to " + USERNAME + ".json: " + e.getMessage());
+        }
+    }
+
+    private static TitleResult processTitleTrophies(String authorization, String targetAccountId, UserTitlesResponse.TrophyTitle title) {
+        try {
+            System.out.println("Processing title: " + title.getTrophyTitleName() + " (" + title.getNpCommunicationId() + ")");
+
+            // Get all trophies for the title
+            List<Trophy> titleTrophies = fetchAllTrophies(authorization, title.getNpCommunicationId(), title.getTrophyTitlePlatform());
+
+            // Get all earned trophies for the title
+            List<Trophy> earnedTrophies = fetchAllEarnedTrophies(authorization, targetAccountId, title.getNpCommunicationId(), title.getTrophyTitlePlatform());
+
+            // Merge the two trophy lists
+            List<Map<String, Object>> mergedTrophies = mergeTrophyLists(titleTrophies, earnedTrophies);
+
+            return new TitleResult(trophyTitles.indexOf(title), mergedTrophies);
+        } catch (Exception e) {
+            System.err.println("Error processing trophies for " + title.getTrophyTitleName() + ": " + e.getMessage());
+            return new TitleResult(trophyTitles.indexOf(title), new ArrayList<>());
+        }
+    }
+
+    private static List<Map<String, Object>> mergeTrophyLists(List<Trophy> titleTrophies, List<Trophy> earnedTrophies) {
+        List<Map<String, Object>> mergedTrophies = new ArrayList<>();
+
+        for (Trophy earnedTrophy : earnedTrophies) {
+            Trophy foundTitleTrophy = titleTrophies.stream()
+                    .filter(t -> t.getTrophyId().equals(earnedTrophy.getTrophyId()))
+                    .findFirst()
+                    .orElse(null);
+
+            if (foundTitleTrophy != null) {
+                mergedTrophies.add(normalizeTrophy(earnedTrophy, foundTitleTrophy));
+            } else {
+                System.out.println("Trophy with ID " + earnedTrophy.getTrophyId() + " not found in title trophies.");
+            }
+        }
+
+        return mergedTrophies;
+    }
+
+    private static Map<String, Object> normalizeTrophy(Trophy earnedTrophy, Trophy titleTrophy) {
+        Map<String, Object> normalizedTrophy = new HashMap<>();
+        normalizedTrophy.put("isEarned", earnedTrophy.isEarned());
+        normalizedTrophy.put("earnedOn", earnedTrophy.isEarned() ? earnedTrophy.getEarnedDateTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) : "unearned");
+        normalizedTrophy.put("type", titleTrophy.getTrophyType().name());
+        normalizedTrophy.put("rarity", getRarityString(titleTrophy.getTrophyRare()));
+        normalizedTrophy.put("earnedRate", titleTrophy.getTrophyEarnedRate());
+        normalizedTrophy.put("trophyName", titleTrophy.getTrophyName());
+        normalizedTrophy.put("groupId", titleTrophy.getTrophyGroupId());
+        return normalizedTrophy;
+    }
+
+    private static String getRarityString(TrophyRarity rarity) {
+        switch (rarity) {
+            case VERY_RARE:
+                return "Very Rare";
+            case ULTRA_RARE:
+                return "Ultra Rare";
+            case RARE:
+                return "Rare";
+            case COMMON:
+                return "Common";
+            default:
+                return "Unknown";
+        }
+    }
+
+    private static class TitleResult {
+        int index;
+        List<Map<String, Object>> mergedTrophies;
+
+        TitleResult(int index, List<Map<String, Object>> mergedTrophies) {
+            this.index = index;
+            this.mergedTrophies = mergedTrophies;
+        }
+    }
+}
+
